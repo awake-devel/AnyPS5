@@ -864,6 +864,8 @@ struct MockVulkan {
     VkPipeline boundPipeline = VK_NULL_HANDLE;
     std::vector<std::byte> lastPushConstants;
     struct { std::uint32_t x = 0, y = 0, z = 0; } lastDispatchGroups;
+    std::vector<VkBorderColor> samplerBorders;
+    std::vector<std::optional<std::array<std::uint32_t, 4>>> samplerCustomBorders;
 };
 
 MockVulkan mock;
@@ -954,9 +956,29 @@ VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t coun
     Require(copyCount == 0, "descriptor copies are not expected");
     for (std::uint32_t i = 0; i < count; ++i) {
         MockDescriptorWrite write{writes[i].dstBinding, writes[i].descriptorCount, writes[i].descriptorType, {}};
-        write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
         mock.writes.push_back(write);
     }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateSampler(VkDevice, const VkSamplerCreateInfo* info, const VkAllocationCallbacks*, VkSampler* sampler) {
+    std::optional<std::array<std::uint32_t, 4>> custom;
+    for (const auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT) continue;
+        const auto* border = reinterpret_cast<const VkSamplerCustomBorderColorCreateInfoEXT*>(next);
+        Require(border->format == VK_FORMAT_UNDEFINED, "a border color table sampler names a format");
+        const auto& words = border->customBorderColor.uint32;
+        custom = std::array<std::uint32_t, 4>{words[0], words[1], words[2], words[3]};
+    }
+    mock.samplerBorders.push_back(info->borderColor);
+    mock.samplerCustomBorders.push_back(custom);
+    *sampler = makeHandle<VkSampler>();
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroySampler(VkDevice, VkSampler, const VkAllocationCallbacks*) {
+    --mock.live;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {
@@ -1058,7 +1080,9 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
-        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
+        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
+        {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
+        {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -1178,6 +1202,47 @@ void pushConstantTests() {
     Require(AgcDriver::Graphics::AssemblePushConstants(shaders)[8] == std::byte{0}, "empty push constants were copied");
     shaders[1].program = nullptr;
     expectFailure([&] { AgcDriver::Graphics::AssemblePushConstants(shaders); }, "missing compiled shader");
+}
+
+alignas(256) std::array<std::uint32_t, 8> borderColorTable{0u, 0u, 0u, 0u, 0x3e19999au, 0x3f000000u, 0x3d4ccccdu, 0u};
+
+void borderColorTableTests() {
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.maxPerStageDescriptorSamplers = 4;
+    context.limits.maxDescriptorSetSamplers = 4;
+    context.limits.maxSamplerAnisotropy = 16.0f;
+    context.customBorderColor = true;
+    context.maxCustomBorderColorSamplers = 4;
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(borderColorTable.data()));
+    const auto build = [](const AgcDriver::Graphics::Context& buildContext, std::vector<std::uint32_t> words, std::optional<std::uint64_t> table) {
+        ShaderRecompiler::RecompileResult compute;
+        const auto count = static_cast<std::uint32_t>(words.size() / 4u);
+        auto binding = makeBinding(Role::GuestSamplers, 2, count, std::move(words));
+        binding.kind = Kind::Sampler;
+        binding.samplerDepthCompare.assign(binding.count, false);
+        compute.bindings.push_back(binding);
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compute, 0};
+        AgcDriver::Graphics::ShaderResources resources(buildContext, shader, {}, table);
+        return resources.Reusable();
+    };
+    constexpr std::uint32_t pointClampToBorder = 0x000000b6u;
+    constexpr std::uint32_t tableEntry1 = 0xc0000001u;
+    const std::array<std::uint32_t, 4> entry1{0x3e19999au, 0x3f000000u, 0x3d4ccccdu, 0u};
+    Require(build(context, {pointClampToBorder, 0u, 0u, 0x00000001u}, base), "a sampler with a fixed border color must leave its build reusable");
+    Require(mock.samplerBorders.size() == 1 && mock.samplerBorders[0] == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK && !mock.samplerCustomBorders[0].has_value(), "a fixed border color sampler was created with a custom border color");
+    Require(!build(context, {pointClampToBorder, 0u, 0u, tableEntry1}, base), "a build that holds a border color table sampler must not be reusable");
+    Require(mock.samplerBorders.size() == 2 && mock.samplerBorders[1] == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT && mock.samplerCustomBorders[1] == entry1, "the border color table entry did not reach the sampler bit for bit");
+    expectFailure([&] { build(context, {pointClampToBorder, 0u, 0u, tableEntry1}, std::nullopt); }, "was never written");
+    expectFailure([&] { build(context, {pointClampToBorder, 0u, 0u, tableEntry1}, base | (std::uint64_t{1} << 48u)); }, "above the 48-bit address");
+    auto unsupported = context;
+    unsupported.customBorderColor = false;
+    expectFailure([&] { build(unsupported, {pointClampToBorder, 0u, 0u, tableEntry1}, base); }, "VK_EXT_custom_border_color");
+    auto limited = context;
+    limited.maxCustomBorderColorSamplers = 1;
+    expectFailure([&] { build(limited, {pointClampToBorder, 0u, 0u, 0xc0000000u, pointClampToBorder, 0u, 0u, tableEntry1}, base); }, "exceed the device limit of 1");
+    static_cast<void>(build(limited, {pointClampToBorder, 0u, 0u, tableEntry1}, base));
+    Require(mock.live == 0, "border color table resources leaked Vulkan objects");
 }
 
 void resourceTests() {
@@ -1334,6 +1399,7 @@ void resourceTests() {
         fragment.bindings.front().binding = 1;
         fragment.bindings.front().guestDescriptor = vsharp(guestFirst.data(), 16);
     }
+    borderColorTableTests();
 }
 
 void misalignedShaderDataTests() {

@@ -20,6 +20,7 @@ std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::ui
 std::uint32_t BytesPerElement(std::uint32_t guestFormat);
 bool IsConvertedTextureFormat(std::uint32_t guestFormat);
 bool IsBlockCompressed(std::uint32_t guestFormat);
+bool IsIntegerFormat(VkFormat format);
 std::uint32_t BlockWidth(std::uint32_t guestFormat);
 std::uint32_t BlockHeight(std::uint32_t guestFormat);
 

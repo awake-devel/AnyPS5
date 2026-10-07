@@ -5,7 +5,9 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -27,6 +29,9 @@ struct GuestSamplerResource {
     bool compareEnable = false;
     VkCompareOp compareOp = VK_COMPARE_OP_NEVER;
     bool unnormalizedCoordinates = false;
+    bool borderColorTable = false;
+    std::uint32_t borderColorPtr = 0;
+    std::optional<std::array<std::uint32_t, 4>> customBorderColor;
 };
 
 GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven = false);

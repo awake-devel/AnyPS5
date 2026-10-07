@@ -94,6 +94,7 @@ struct State {
     VkFrontFace frontFace;
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
+    std::optional<std::uint64_t> borderColorTable;
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue);
@@ -144,8 +145,8 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 45> DrawKeyRegisters{{
-    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 4},
+inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
+    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 4}, {RegisterBank::Context, 0x020, 2},
     {RegisterBank::Context, 0x080, 4}, {RegisterBank::Context, 0x08c, 4}, {RegisterBank::Context, 0x090, 2}, {RegisterBank::Context, 0x094, 2}, {RegisterBank::Context, 0x0b4, 2}, {RegisterBank::Context, 0x105, 4}, {RegisterBank::Context, 0x10b, 3}, {RegisterBank::Context, 0x10f, 6},
     // SPI_PS_INPUT_CNTL_0..31, SPI_PS_INPUT_ENA/ADDR, SPI_PS_IN_CONTROL, SPI_SHADER_POS/Z/COL_FORMAT,
     // CB_BLEND0..7_CONTROL, GE_MAX_OUTPUT_PER_SUBGROUP.
@@ -164,6 +165,7 @@ inline constexpr std::array<DrawKeyRange, 45> DrawKeyRegisters{{
 }};
 // Whether DrawKeyRegisters holds the read.
 bool DrawKeyCovers(RegisterRead read);
+std::optional<std::uint64_t> BorderColorTableBase(const Registers& registers, std::uint32_t lowOffset, RegisterBank bank);
 
 }
 

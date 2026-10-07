@@ -42,6 +42,7 @@ struct Fields {
     bool anisoOverride = false;
     bool blendZeroPrt = false;
     std::uint32_t borderColorType = 0;
+    std::uint32_t borderColorPtr = 0;
 };
 
 std::array<std::uint32_t, 4> pack(const Fields& f) {
@@ -54,7 +55,7 @@ std::array<std::uint32_t, 4> pack(const Fields& f) {
     words[2] = (f.lodBiasRaw & 0x3fffu) | ((f.lodBiasSec & 0x3fu) << 14u) | ((f.xyMagFilter & 0x3u) << 20u)
         | ((f.xyMinFilter & 0x3u) << 22u) | ((f.zFilter & 0x3u) << 24u) | ((f.mipFilter & 0x3u) << 26u)
         | ((f.pointPreclamp ? 1u : 0u) << 28u) | ((f.anisoOverride ? 1u : 0u) << 29u) | ((f.blendZeroPrt ? 1u : 0u) << 30u);
-    words[3] = (f.borderColorType & 0x3u) << 30u;
+    words[3] = (f.borderColorPtr & 0xfffu) | ((f.borderColorType & 0x3u) << 30u);
     return words;
 }
 
@@ -406,20 +407,37 @@ void RunGuestSamplerResourceTests() {
     for (std::uint32_t mode : {0u, 1u, 2u, 3u}) {
         Fields unreadMode = base;
         unreadMode.borderColorType = 3;
+        unreadMode.borderColorPtr = 5;
         unreadMode.clampX = mode;
-        DecodeSamplerResource(pack(unreadMode));
+        const auto decoded = DecodeSamplerResource(pack(unreadMode));
+        Require(!decoded.borderColorTable && decoded.borderColorPtr == 0u, "a table border colour no axis reads must not name a table entry");
     }
     for (std::uint32_t mode : {4u, 5u, 6u, 7u}) {
         for (int axis = 0; axis < 3; ++axis) {
-            Fields readTable = base;
-            readTable.borderColorType = 3;
-            (axis == 0 ? readTable.clampX : axis == 1 ? readTable.clampY : readTable.clampZ) = mode;
-            rejectFields(readTable, "border color table");
+            for (std::uint32_t pointer : {0u, 1u, 0xabcu, 0xfffu}) {
+                Fields readTable = base;
+                readTable.borderColorType = 3;
+                readTable.borderColorPtr = pointer;
+                (axis == 0 ? readTable.clampX : axis == 1 ? readTable.clampY : readTable.clampZ) = mode;
+                const auto decoded = DecodeSamplerResource(pack(readTable));
+                Require(decoded.borderColorTable, "a table border colour read through clamp mode " + std::to_string(mode) + " must name a table entry");
+                Require(decoded.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT, "a table border colour must decode to a custom float border colour");
+                Require(decoded.borderColorPtr == pointer, "BORDER_COLOR_PTR " + std::to_string(pointer) + " decoded as " + std::to_string(decoded.borderColorPtr));
+            }
         }
+    }
+    for (std::uint32_t type : {0u, 1u, 2u}) {
+        Fields fixed = base;
+        fixed.clampX = 6;
+        fixed.borderColorType = type;
+        fixed.borderColorPtr = 0x123;
+        const auto decoded = DecodeSamplerResource(pack(fixed));
+        Require(!decoded.borderColorTable && decoded.borderColorPtr == 0u, "a fixed border colour must not name a table entry");
     }
     const std::array<std::uint32_t, 4> capturedTable{0x00007092u, 0x00fff000u, 0x05000000u, 0xc0000000u};
     const auto capturedUnread = DecodeSamplerResource(capturedTable);
     Require(capturedUnread.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && capturedUnread.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "captured table-border sampler decoded incorrectly");
+    Require(!capturedUnread.borderColorTable, "captured table-border sampler reads no border and must not name a table entry");
 
     Fields opaqueBlack = base;
     opaqueBlack.borderColorType = 1;

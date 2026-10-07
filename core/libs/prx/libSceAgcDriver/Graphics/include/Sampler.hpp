@@ -21,6 +21,7 @@ public:
 
     VkSampler Handle() const;
     bool RequiresFilterMinmax() const;
+    bool CustomBorderColor() const;
 
 private:
     void release() noexcept;
@@ -28,11 +29,13 @@ private:
     Context context;
     VkSampler sampler = VK_NULL_HANDLE;
     bool requiresFilterMinmax = false;
+    bool customBorderColor = false;
 };
 
-// One VkSampler per distinct S# (its 4 words plus the shader's depth-compare use and the
-// unnormalized proof): samplers are immutable and DecodeSamplerResource is a pure function of the
-// words and the proof, so equal keys mean equal samplers and nothing ever invalidates an entry.
+// One VkSampler per distinct S# (its 4 words plus the shader's depth-compare use, the
+// unnormalized proof and a border colour table entry's 4 words): samplers are immutable and
+// DecodeSamplerResource is a pure function of the words and the proof, so equal keys mean equal
+// samplers and nothing ever invalidates an entry.
 // Holders keep a shared_ptr, so an entry evicted from the LRU-capped cache lives on while a
 // descriptor set in flight references it. One cache per device.
 // APS5_NO_SAMPLER_CACHE=1 creates a sampler per binding as before.
@@ -41,7 +44,7 @@ public:
     explicit SamplerCache(std::size_t capacity = 1024);
     SamplerCache(const SamplerCache&) = delete;
     SamplerCache& operator=(const SamplerCache&) = delete;
-    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false);
+    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false, std::span<const std::uint32_t> borderColor = {});
     // APS5_PROFILE_DRAW counters: lookups served by an existing sampler, and samplers created.
     std::uint64_t Hits() const { return hits; }
     std::uint64_t Misses() const { return misses; }
@@ -52,7 +55,7 @@ private:
         std::uint64_t lastUse;
     };
     std::mutex mutex;
-    std::map<std::array<std::uint32_t, 5>, Entry> entries;
+    std::map<std::array<std::uint32_t, 9>, Entry> entries;
     std::uint64_t clock = 0;
     std::size_t capacity;
     std::uint64_t hits = 0;

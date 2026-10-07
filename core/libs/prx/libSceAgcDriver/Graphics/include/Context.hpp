@@ -137,6 +137,8 @@ struct Context {
     bool imageInt64Atomics = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
+    bool customBorderColor = false;
+    std::uint32_t maxCustomBorderColorSamplers = 0;
     bool pipelineExecutableInfo = false;
     std::uint32_t srgbDecodeFormats = 0;
 

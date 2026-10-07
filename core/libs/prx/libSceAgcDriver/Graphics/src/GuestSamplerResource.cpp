@@ -86,6 +86,7 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     const auto anisoOverride = ((words[2] >> 29u) & 0x1u) != 0;
     const auto blendZeroPrt = ((words[2] >> 30u) & 0x1u) != 0;
 
+    const auto borderColorPtr = words[3] & 0xfffu;
     const auto borderColorType = (words[3] >> 30u) & 0x3u;
 
     Require(!forceUnormCoords || unnormalizedProven, "guest sampler descriptor uses unnormalized coordinates which are not implemented");
@@ -135,13 +136,14 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     }
 
     VkBorderColor border;
+    bool borderColorTable = false;
     switch (borderColorType) {
         case 0: border = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK; break;
         case 1: border = VK_BORDER_COLOR_INT_OPAQUE_BLACK; break;
         case 2: border = VK_BORDER_COLOR_INT_OPAQUE_WHITE; break;
         default:
-            if (readsBorderColor(clampX) || readsBorderColor(clampY) || readsBorderColor(clampZ)) throw std::runtime_error("AGC graphics: guest sampler descriptor uses a border color table which is not implemented");
-            border = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+            borderColorTable = readsBorderColor(clampX) || readsBorderColor(clampY) || readsBorderColor(clampZ);
+            border = borderColorTable ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT : VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
             break;
     }
 
@@ -158,6 +160,8 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     result.maxLod = maxLod;
     result.lodBias = toSignedLodBias(lodBiasRaw);
     result.borderColor = border;
+    result.borderColorTable = borderColorTable;
+    result.borderColorPtr = borderColorTable ? borderColorPtr : 0u;
     result.reductionMode = reductionMode;
     const std::array compareOps{VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS};
     result.compareOp = compareOps.at(depthCompareFunc);

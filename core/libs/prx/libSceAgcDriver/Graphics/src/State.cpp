@@ -429,9 +429,20 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     return result;
 }
 
+std::optional<std::uint64_t> BorderColorTableBase(const Registers& registers, std::uint32_t lowOffset, RegisterBank bank) {
+    NoteRegisterRead(bank, lowOffset);
+    NoteRegisterRead(bank, lowOffset + 1u);
+    const auto low = registers.find(lowOffset);
+    if (low == registers.end()) return std::nullopt;
+    const auto high = registers.find(lowOffset + 1u);
+    const std::uint32_t highBits = high == registers.end() ? 0u : high->second;
+    return (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(highBits) << 40u);
+}
+
 State DecodeState(const QueueState& queue) {
     const auto& cx = queue.context;
     State result{};
+    result.borderColorTable = BorderColorTableBase(cx, 0x20u, RegisterBank::Context);
     result.stages = DecodeShaderStages(queue);
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     APS5_LOG_OUT_DEBUG("DecodeState primitive=%u path=%u vertexWave=%u", primitive, static_cast<unsigned>(result.stages.path), result.stages.vertexWaveSize);
