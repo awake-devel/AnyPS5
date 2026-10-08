@@ -333,6 +333,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         }
         threadExitJump = nullptr;
     });
+    p->hostThread = p->_thr.native_handle();
     try {
         if (detached) p->_thr.detach();
     } catch (...) {
@@ -418,6 +419,7 @@ Pthread APS5_VABI scePthreadSelf() {
         adoptedThread->_detached = true;
         adoptedThread->_adopted = true;
         adoptedThread->threadId = std::this_thread::get_id();
+        adoptedThread->hostThread = pthread_self();
         SetStackFromHost(adoptedThread.get());
         currentThread = adoptedThread.get();
     }
