@@ -1,4 +1,5 @@
 #include "SceTypes.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -54,6 +55,8 @@ static std::atomic<std::uint64_t> observedR13{0};
 static std::atomic<std::uint64_t> observedXmm8{0};
 static std::atomic<std::uint32_t> observedMxcsr{0};
 static std::atomic<Pthread> handlerSelf{nullptr};
+static std::atomic<bool> redeliverPatch{false};
+static std::atomic<int> redeliverEntries{0};
 static std::atomic<bool> maskProbe{false};
 static std::atomic<int> probeEntries{0};
 static std::atomic<std::uint32_t> probeSeen{0};
@@ -80,6 +83,10 @@ static void APS5_VABI Handler(int signum, void* context) {
         std::memcpy(bytes + MxcsrOffset, &mxcsr, sizeof(mxcsr));
     }
     handlerSelf.store(scePthreadSelf());
+    if (redeliverPatch.load()) {
+        if (redeliverEntries.fetch_add(1) == 0) Require(sceKernelRaiseException(scePthreadSelf(), SIGUSR1) == 0);
+        else std::memcpy(bytes + R12Offset, &PatchedR12, sizeof(PatchedR12));
+    }
     if (maskProbe.load() && probeEntries.fetch_add(1) == 0) {
         GuestSignalSet seen{{}};
         Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
@@ -220,6 +227,24 @@ static void* APS5_VABI Masked(void*) {
     return nullptr;
 }
 
+static constexpr auto ToggleDuration = std::chrono::seconds(2);
+static std::atomic<bool> toggleStop{false};
+static std::atomic<int> toggleMismatches{0};
+
+static void* APS5_VABI Toggling(void*) {
+    const GuestSignalSet interrupt{{1u << (2 - 1), 0, 0, 0}};
+    while (!toggleStop.load()) {
+        GuestSignalSet seen{{}};
+        Require(sigprocmask_nid_postfix(1, &interrupt, nullptr) == 0);
+        Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
+        if ((seen.bits[0] & interrupt.bits[0]) == 0) toggleMismatches.fetch_add(1);
+        Require(sigprocmask_nid_postfix(2, &interrupt, nullptr) == 0);
+        Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
+        if ((seen.bits[0] & interrupt.bits[0]) != 0) toggleMismatches.fetch_add(1);
+    }
+    return nullptr;
+}
+
 static std::atomic<bool> finishedReturned{false};
 
 static void* APS5_VABI Finished(void*) {
@@ -322,6 +347,16 @@ int main() {
     Require(spin.r12 == PatchedR12 && spin.xmm8 == PatchedXmm8);
     Require(spin.mxcsr == (observedMxcsr.load() | FlushToZero));
 
+    SpinState redeliver;
+    Pthread redeliverThread = nullptr;
+    Require(scePthreadCreate(&redeliverThread, nullptr, Spinning, &redeliver, "redeliver") == 0);
+    while (redeliver.started.load() == 0) std::this_thread::yield();
+    redeliverPatch.store(true);
+    Require(sceKernelRaiseException(redeliverThread, SIGUSR1) == 0);
+    Require(scePthreadJoin(redeliverThread, nullptr) == 0);
+    redeliverPatch.store(false);
+    Require(redeliverEntries.load() == 2 && redeliver.r12 == PatchedR12);
+
     for (int round = 0; round < StartingRounds; ++round) {
         const int before = calls.load();
         startingRelease.store(false);
@@ -367,6 +402,15 @@ int main() {
     Require(afterProbe.bits[0] == ((1u << (15 - 1)) | (1u << (16 - 1)) | (1u << (2 - 1))));
     const GuestSignalSet noSignals{{}};
     Require(sigprocmask_nid_postfix(3, &noSignals, nullptr) == 0);
+
+    std::array<Pthread, 2> togglingThreads{};
+    for (auto& toggling : togglingThreads) Require(scePthreadCreate(&toggling, nullptr, Toggling, nullptr, "toggling") == 0);
+    const auto toggleEnd = std::chrono::steady_clock::now() + ToggleDuration;
+    for (std::size_t raised = 0; std::chrono::steady_clock::now() < toggleEnd; ++raised)
+        Require(sceKernelRaiseException(togglingThreads[raised % togglingThreads.size()], SIGUSR1) == 0);
+    toggleStop.store(true);
+    for (const auto toggling : togglingThreads) Require(scePthreadJoin(toggling, nullptr) == 0);
+    Require(toggleMismatches.load() == 0);
 
     Pthread finishedThread = nullptr;
     Require(scePthreadCreate(&finishedThread, nullptr, Finished, nullptr, "finished") == 0);

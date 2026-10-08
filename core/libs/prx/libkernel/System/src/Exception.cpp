@@ -151,8 +151,16 @@ struct Delivery {
     GuestSignalMask::Mask interrupted;
 };
 
-void Deliver(const Delivery& delivery, CONTEXT& context) {
-    const auto handler = delivery.handler;
+bool Claim(PthreadPrivate& thread, int signum, GuestSignalMask::Mask& interrupted) {
+    const std::uint32_t bit = GuestSignalBit(signum);
+    interrupted = GuestSignalMask::Stored(thread);
+    interrupted[0] = thread.signalMask[0].fetch_or(bit);
+    if ((interrupted[0] & bit) == 0) return true;
+    thread.pendingSignals.fetch_or(bit);
+    return false;
+}
+
+void RunHandler(const Delivery& delivery, GuestExceptionHandler handler, const GuestSignalMask::Mask& interrupted, CONTEXT& context) {
     const int signum = delivery.signum;
     GuestUcontext ucontext{};
     auto& m = ucontext.mcontext;
@@ -179,7 +187,7 @@ void Deliver(const Delivery& delivery, CONTEXT& context) {
     m.len = sizeof(GuestMcontext);
     static_assert(sizeof(context.FltSave) <= sizeof(m.fpstate));
     std::memcpy(m.fpstate, &context.FltSave, sizeof(context.FltSave));
-    SetContextMask(ucontext, delivery.interrupted);
+    SetContextMask(ucontext, interrupted);
     CallHandler(handler, signum, ucontext);
     GuestSignalMask::Store(*delivery.thread, ContextMask(ucontext));
     context.Rdi = m.rdi;
@@ -202,7 +210,21 @@ void Deliver(const Delivery& delivery, CONTEXT& context) {
     context.EFlags = static_cast<DWORD>(m.rflags);
     std::memcpy(&context.FltSave, m.fpstate, sizeof(context.FltSave));
     context.MxCsr = context.FltSave.MxCsr;
-    GuestSignalMask::DeliverUnblocked(*delivery.thread);
+}
+
+void Deliver(const Delivery& delivery, CONTEXT& context) {
+    auto& thread = *delivery.thread;
+    const std::uint32_t bit = GuestSignalBit(delivery.signum);
+    auto handler = delivery.handler;
+    auto interrupted = delivery.interrupted;
+    for (;;) {
+        RunHandler(delivery, handler, interrupted, context);
+        if (GuestSignalBlocked(thread, delivery.signum) || (thread.pendingSignals.fetch_and(~bit) & bit) == 0) break;
+        handler = Handler(delivery.signum);
+        if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: no handler installed for the signal");
+        if (!Claim(thread, delivery.signum, interrupted)) break;
+    }
+    GuestSignalMask::DeliverUnblocked(thread);
 }
 
 [[noreturn]] void RedirectedEntry(Delivery* redirected) {
@@ -225,6 +247,7 @@ bool StackWritable(DWORD64 low, DWORD64 high) {
 
 void CALLBACK WaitingEntry(ULONG_PTR parameter) {
     const std::unique_ptr<Delivery> delivery(reinterpret_cast<Delivery*>(parameter));
+    if (!Claim(*delivery->thread, delivery->signum, delivery->interrupted)) return;
     CONTEXT context{};
     RtlCaptureContext(&context);
     Deliver(*delivery, context);
@@ -237,20 +260,10 @@ bool Exited(HANDLE native) {
     return WaitForSingleObject(native, 0) == WAIT_OBJECT_0;
 }
 
-bool Claim(Delivery& delivery) {
-    auto& thread = *delivery.thread;
-    const std::uint32_t bit = GuestSignalBit(delivery.signum);
-    delivery.interrupted = GuestSignalMask::Stored(thread);
-    delivery.interrupted[0] = thread.signalMask[0].fetch_or(bit);
-    if ((delivery.interrupted[0] & bit) == 0) return true;
-    thread.pendingSignals.fetch_or(bit);
-    return false;
-}
-
 bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     if (thread == scePthreadSelf()) {
         Delivery delivery{handler, signum, {}, thread, {}};
-        if (!Claim(delivery)) return true;
+        if (!Claim(*thread, signum, delivery.interrupted)) return true;
         CONTEXT context{};
         RtlCaptureContext(&context);
         Deliver(delivery, context);
@@ -272,7 +285,19 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
         ResumeThread(native);
         throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
     }
-    if (!Claim(*queued)) {
+    if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
+        if (GuestSignalBlocked(*thread, signum)) {
+            thread->pendingSignals.fetch_or(GuestSignalBit(signum));
+            ResumeThread(native);
+            return true;
+        }
+        const bool accepted = QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) != 0;
+        ResumeThread(native);
+        if (!accepted) throw std::runtime_error("sceKernelRaiseException: cannot queue delivery to the waiting thread");
+        queued.release();
+        return true;
+    }
+    if (!Claim(*thread, signum, queued->interrupted)) {
         ResumeThread(native);
         return true;
     }
@@ -281,13 +306,6 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
         ResumeThread(native);
         throw std::runtime_error(message);
     };
-    if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
-        if (QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) == 0)
-            fail("sceKernelRaiseException: cannot queue delivery to the waiting thread");
-        queued.release();
-        ResumeThread(native);
-        return true;
-    }
     alignas(16) Delivery delivery = *queued;
     delivery.context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
     if (!GetThreadContext(native, &delivery.context))

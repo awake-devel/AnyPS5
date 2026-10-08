@@ -68,28 +68,17 @@ void Dispatch(int native) {
 #endif
 }
 
-GuestSignalMask::Mask CurrentMask(const PthreadPrivate& self) {
-    auto mask = GuestSignalMask::Stored(self);
 #ifndef _WIN32
-    sigset_t host;
-    pthread_sigmask(SIG_BLOCK, nullptr, &host);
-    GuestSignalMask::ReadHost(host, mask);
-#endif
-    return mask;
+const sigset_t& GuardedSignals() {
+    static const sigset_t guarded = [] {
+        sigset_t set;
+        sigemptyset(&set);
+        for (const int guest : MaskedSignals) sigaddset(&set, HostSignal(guest));
+        return set;
+    }();
+    return guarded;
 }
-
-void ApplyMask(PthreadPrivate& self, const GuestSignalMask::Mask& mask) {
-#ifdef _WIN32
-    (void)mask;
-    GuestSignalMask::DeliverUnblocked(self);
-#else
-    (void)self;
-    sigset_t host;
-    pthread_sigmask(SIG_BLOCK, nullptr, &host);
-    GuestSignalMask::WriteHost(mask, host);
-    pthread_sigmask(SIG_SETMASK, &host, nullptr);
 #endif
-}
 }
 
 namespace GuestSignalMask {
@@ -173,8 +162,15 @@ int APS5_VABI raise_nid_postfix(int guest) {
 }
 int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet) {
     if (set != nullptr && (how < 1 || how > 3)) throw std::invalid_argument("_sigprocmask: invalid how");
-    auto* self = scePthreadSelf();
-    const auto previous = CurrentMask(*self);
+    auto& self = *scePthreadSelf();
+    auto previous = GuestSignalMask::Stored(self);
+#ifdef _WIN32
+    previous[0] = self.signalMask[0].fetch_or(GuestSignalBit(GUEST_RAISED_SIGNAL));
+#else
+    sigset_t host;
+    pthread_sigmask(SIG_BLOCK, &GuardedSignals(), &host);
+    GuestSignalMask::ReadHost(host, previous);
+#endif
     auto next = previous;
     if (set != nullptr) {
         for (std::size_t word = 0; word < next.size(); ++word) {
@@ -184,11 +180,16 @@ int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, Guest
                 default: next[word] = set->bits[word]; break;
             }
         }
-        GuestSignalMask::Store(*self, next);
     }
+    GuestSignalMask::Store(self, next);
     if (previousSet != nullptr)
         for (std::size_t word = 0; word < previous.size(); ++word) previousSet->bits[word] = previous[word];
-    if (set != nullptr) ApplyMask(*self, GuestSignalMask::Stored(*self));
+#ifdef _WIN32
+    GuestSignalMask::DeliverUnblocked(self);
+#else
+    GuestSignalMask::WriteHost(GuestSignalMask::Stored(self), host);
+    pthread_sigmask(SIG_SETMASK, &host, nullptr);
+#endif
     return 0;
 }
 
