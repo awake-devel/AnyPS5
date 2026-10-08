@@ -4,6 +4,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/System/include/GuestSignalMask.hpp"
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -120,6 +121,16 @@ void SetFpWord(GuestMcontext& m, std::size_t offset, std::uint32_t value) {
     std::memcpy(reinterpret_cast<unsigned char*>(m.fpstate) + offset, &value, sizeof(value));
 }
 
+GuestSignalMask::Mask ContextMask(const GuestUcontext& ucontext) {
+    GuestSignalMask::Mask mask{};
+    std::memcpy(mask.data(), ucontext.sigmask, sizeof(ucontext.sigmask));
+    return mask;
+}
+
+void SetContextMask(GuestUcontext& ucontext, const GuestSignalMask::Mask& mask) {
+    std::memcpy(ucontext.sigmask, mask.data(), sizeof(ucontext.sigmask));
+}
+
 void CallHandler(GuestExceptionHandler handler, int signum, GuestUcontext& ucontext) {
     auto& m = ucontext.mcontext;
     const std::uint32_t mxcsrMask = FpWord(m, MxcsrMaskOffset);
@@ -136,9 +147,13 @@ struct Delivery {
     GuestExceptionHandler handler;
     int signum;
     CONTEXT context;
+    PthreadPrivate* thread;
+    GuestSignalMask::Mask interrupted;
 };
 
-void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
+void Deliver(const Delivery& delivery, CONTEXT& context) {
+    const auto handler = delivery.handler;
+    const int signum = delivery.signum;
     GuestUcontext ucontext{};
     auto& m = ucontext.mcontext;
     m.rdi = context.Rdi;
@@ -164,7 +179,9 @@ void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
     m.len = sizeof(GuestMcontext);
     static_assert(sizeof(context.FltSave) <= sizeof(m.fpstate));
     std::memcpy(m.fpstate, &context.FltSave, sizeof(context.FltSave));
+    SetContextMask(ucontext, delivery.interrupted);
     CallHandler(handler, signum, ucontext);
+    GuestSignalMask::Store(*delivery.thread, ContextMask(ucontext));
     context.Rdi = m.rdi;
     context.Rsi = m.rsi;
     context.Rdx = m.rdx;
@@ -185,11 +202,13 @@ void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
     context.EFlags = static_cast<DWORD>(m.rflags);
     std::memcpy(&context.FltSave, m.fpstate, sizeof(context.FltSave));
     context.MxCsr = context.FltSave.MxCsr;
+    GuestSignalMask::DeliverUnblocked(*delivery.thread);
 }
 
-[[noreturn]] void RedirectedEntry(Delivery* delivery) {
-    CONTEXT context = delivery->context;
-    Deliver(delivery->handler, delivery->signum, context);
+[[noreturn]] void RedirectedEntry(Delivery* redirected) {
+    const Delivery delivery = *redirected;
+    CONTEXT context = delivery.context;
+    Deliver(delivery, context);
     RtlRestoreContext(&context, nullptr);
     std::abort();
 }
@@ -205,13 +224,10 @@ bool StackWritable(DWORD64 low, DWORD64 high) {
 }
 
 void CALLBACK WaitingEntry(ULONG_PTR parameter) {
-    auto* delivery = reinterpret_cast<Delivery*>(parameter);
-    const auto handler = delivery->handler;
-    const int signum = delivery->signum;
-    delete delivery;
+    const std::unique_ptr<Delivery> delivery(reinterpret_cast<Delivery*>(parameter));
     CONTEXT context{};
     RtlCaptureContext(&context);
-    Deliver(handler, signum, context);
+    Deliver(*delivery, context);
 }
 
 static_assert(HomeArea + 8 == 40, "Aps5RedirectedEntryStub finds the delivery 40 bytes above its stack pointer");
@@ -221,19 +237,27 @@ bool Exited(HANDLE native) {
     return WaitForSingleObject(native, 0) == WAIT_OBJECT_0;
 }
 
+bool Claim(Delivery& delivery) {
+    auto& thread = *delivery.thread;
+    const std::uint32_t bit = GuestSignalBit(delivery.signum);
+    delivery.interrupted = GuestSignalMask::Stored(thread);
+    delivery.interrupted[0] = thread.signalMask[0].fetch_or(bit);
+    if ((delivery.interrupted[0] & bit) == 0) return true;
+    thread.pendingSignals.fetch_or(bit);
+    return false;
+}
+
 bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     if (thread == scePthreadSelf()) {
-        if (GuestSignalBlocked(*thread, signum)) {
-            thread->pendingSignals.fetch_or(GuestSignalBit(signum));
-            return true;
-        }
+        Delivery delivery{handler, signum, {}, thread, {}};
+        if (!Claim(delivery)) return true;
         CONTEXT context{};
         RtlCaptureContext(&context);
-        Deliver(handler, signum, context);
+        Deliver(delivery, context);
         return true;
     }
     const auto native = static_cast<HANDLE>(thread->nativeHandle);
-    auto queued = std::make_unique<Delivery>(Delivery{handler, signum, {}});
+    auto queued = std::make_unique<Delivery>(Delivery{handler, signum, {}, thread, {}});
     if (SuspendThread(native) == static_cast<DWORD>(-1)) {
         if (Exited(native)) return false;
         throw std::runtime_error("sceKernelRaiseException: cannot suspend the target thread");
@@ -248,37 +272,35 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
         ResumeThread(native);
         throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
     }
-    if (GuestSignalBlocked(*thread, signum)) {
-        thread->pendingSignals.fetch_or(GuestSignalBit(signum));
+    if (!Claim(*queued)) {
         ResumeThread(native);
         return true;
     }
+    const auto fail = [&](const char* message) {
+        thread->signalMask[0].fetch_and(~GuestSignalBit(signum));
+        ResumeThread(native);
+        throw std::runtime_error(message);
+    };
     if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
-        const bool accepted = QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) != 0;
-        ResumeThread(native);
-        if (!accepted) throw std::runtime_error("sceKernelRaiseException: cannot queue delivery to the waiting thread");
+        if (QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) == 0)
+            fail("sceKernelRaiseException: cannot queue delivery to the waiting thread");
         queued.release();
+        ResumeThread(native);
         return true;
     }
-    alignas(16) Delivery delivery{handler, signum, {}};
+    alignas(16) Delivery delivery = *queued;
     delivery.context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
-    if (!GetThreadContext(native, &delivery.context)) {
-        ResumeThread(native);
-        throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
-    }
+    if (!GetThreadContext(native, &delivery.context))
+        fail("sceKernelRaiseException: cannot read the target thread context");
     const DWORD64 slot = (delivery.context.Rsp - RedZone - sizeof(Delivery)) & ~static_cast<DWORD64>(15);
-    if (!StackWritable(slot - HomeArea - 8, delivery.context.Rsp - RedZone)) {
-        ResumeThread(native);
-        throw std::runtime_error("sceKernelRaiseException: the target thread stack below its red zone is not committed");
-    }
+    if (!StackWritable(slot - HomeArea - 8, delivery.context.Rsp - RedZone))
+        fail("sceKernelRaiseException: the target thread stack below its red zone is not committed");
     std::memcpy(reinterpret_cast<void*>(slot), &delivery, sizeof(Delivery));
     CONTEXT redirected = delivery.context;
     redirected.Rsp = slot - HomeArea - 8;
     redirected.Rip = reinterpret_cast<DWORD64>(&Aps5RedirectedEntryStub);
-    if (!SetThreadContext(native, &redirected)) {
-        ResumeThread(native);
-        throw std::runtime_error("sceKernelRaiseException: cannot redirect the target thread");
-    }
+    if (!SetThreadContext(native, &redirected))
+        fail("sceKernelRaiseException: cannot redirect the target thread");
     ResumeThread(native);
     return true;
 }
@@ -343,11 +365,21 @@ void Deliver(int, siginfo_t*, void* context) {
         (void)written;
         std::abort();
     }
-    auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
+    auto& hostContext = *static_cast<ucontext_t*>(context);
+    auto* self = CurrentGuestThread();
     GuestUcontext ucontext{};
-    FromHost(host, ucontext.mcontext);
+    FromHost(hostContext.uc_mcontext, ucontext.mcontext);
+    if (self != nullptr) {
+        auto interrupted = GuestSignalMask::Stored(*self);
+        GuestSignalMask::ReadHost(hostContext.uc_sigmask, interrupted);
+        SetContextMask(ucontext, interrupted);
+    }
     CallHandler(handler, GUEST_RAISED_SIGNAL, ucontext);
-    ToHost(ucontext.mcontext, host);
+    ToHost(ucontext.mcontext, hostContext.uc_mcontext);
+    if (self != nullptr) {
+        GuestSignalMask::Store(*self, ContextMask(ucontext));
+        GuestSignalMask::WriteHost(GuestSignalMask::Stored(*self), hostContext.uc_sigmask);
+    }
 }
 
 void InstallDelivery() {

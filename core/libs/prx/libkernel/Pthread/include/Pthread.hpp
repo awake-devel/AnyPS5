@@ -115,6 +115,7 @@ struct PthreadPrivate {
 };
 
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
+PthreadPrivate* CurrentGuestThread();
 
 constexpr std::uint32_t GuestSignalBit(int signum) {
     return 1u << ((signum - 1) & 31);

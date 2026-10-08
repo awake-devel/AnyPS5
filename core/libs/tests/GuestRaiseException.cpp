@@ -54,6 +54,11 @@ static std::atomic<std::uint64_t> observedR13{0};
 static std::atomic<std::uint64_t> observedXmm8{0};
 static std::atomic<std::uint32_t> observedMxcsr{0};
 static std::atomic<Pthread> handlerSelf{nullptr};
+static std::atomic<bool> maskProbe{false};
+static std::atomic<int> probeEntries{0};
+static std::atomic<std::uint32_t> probeSeen{0};
+static std::atomic<std::uint32_t> probeContext{0};
+static std::atomic<int> probeNested{0};
 
 static void APS5_VABI Handler(int signum, void* context) {
     Require(signum == SIGUSR1);
@@ -75,6 +80,18 @@ static void APS5_VABI Handler(int signum, void* context) {
         std::memcpy(bytes + MxcsrOffset, &mxcsr, sizeof(mxcsr));
     }
     handlerSelf.store(scePthreadSelf());
+    if (maskProbe.load() && probeEntries.fetch_add(1) == 0) {
+        GuestSignalSet seen{{}};
+        Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
+        probeSeen.store(seen.bits[0]);
+        std::uint32_t contextMask = 0;
+        std::memcpy(&contextMask, bytes, sizeof(contextMask));
+        probeContext.store(contextMask);
+        contextMask |= (1u << (16 - 1)) | (1u << (2 - 1));
+        std::memcpy(bytes, &contextMask, sizeof(contextMask));
+        Require(sceKernelRaiseException(scePthreadSelf(), SIGUSR1) == 0);
+        probeNested.store(probeEntries.load());
+    }
     int local = 0;
     handlerFrame.store(reinterpret_cast<std::uintptr_t>(&local));
     handlerRsp.store(rsp);
@@ -336,6 +353,20 @@ int main() {
     maskedStage.store(2);
     ExpectDelivery(before, maskedId.load());
     Require(scePthreadJoin(maskedThread, nullptr) == 0);
+
+    const GuestSignalSet termSet{{1u << (15 - 1), 0, 0, 0}};
+    Require(sigprocmask_nid_postfix(1, &termSet, nullptr) == 0);
+    before = calls.load();
+    maskProbe.store(true);
+    Require(sceKernelRaiseException(scePthreadSelf(), SIGUSR1) == 0);
+    maskProbe.store(false);
+    Require(calls.load() == before + 2 && probeEntries.load() == 2 && probeNested.load() == 1);
+    Require(probeSeen.load() == ((1u << (15 - 1)) | Sigusr1Set.bits[0]) && probeContext.load() == (1u << (15 - 1)));
+    GuestSignalSet afterProbe{{}};
+    Require(sigprocmask_nid_postfix(1, nullptr, &afterProbe) == 0);
+    Require(afterProbe.bits[0] == ((1u << (15 - 1)) | (1u << (16 - 1)) | (1u << (2 - 1))));
+    const GuestSignalSet noSignals{{}};
+    Require(sigprocmask_nid_postfix(3, &noSignals, nullptr) == 0);
 
     Pthread finishedThread = nullptr;
     Require(scePthreadCreate(&finishedThread, nullptr, Finished, nullptr, "finished") == 0);

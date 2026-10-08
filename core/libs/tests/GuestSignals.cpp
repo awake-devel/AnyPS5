@@ -30,6 +30,19 @@ static std::atomic<std::uint32_t> childInherited{0};
 static std::atomic<std::uint32_t> childInheritedHigh{0};
 static std::atomic<std::uint32_t> childUnblocked{0};
 static std::atomic<int> childReceived{0};
+static std::atomic<int> scopedEntries{0};
+static std::atomic<std::uint32_t> scopedSeen{0};
+static std::atomic<int> scopedNested{0};
+void APS5_VABI Scoped(int value) {
+    if (scopedEntries.fetch_add(1) != 0) return;
+    GuestSignalSet seen{{}};
+    Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
+    scopedSeen.store(seen.bits[0]);
+    const GuestSignalSet urgent{{Bit(16), 0, 0, 0}};
+    Require(sigprocmask_nid_postfix(1, &urgent, nullptr) == 0);
+    Require(raise_nid_postfix(value) == 0);
+    scopedNested.store(scopedEntries.load());
+}
 static void* APS5_VABI Child(void*) {
     GuestSignalSet seen{{}};
     Require(sigprocmask_nid_postfix(1, nullptr, &seen) == 0);
@@ -93,9 +106,13 @@ int main() {
     Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0);
     Require(previous.bits[0] == (0xffffffffu & ~(Bit(9) | Bit(17) | Bit(32))));
     Require(previous.bits[1] == 0x1u && previous.bits[2] == 0x80000000u && previous.bits[3] == 0x5u);
+    const GuestSignalSet wideApplied = previous;
+    Require(sigprocmask_nid_postfix(3, &term, nullptr) == 0);
     GuestSignalSet same = wide;
     Require(sigprocmask_nid_postfix(3, &same, &same) == 0);
-    Require(same.bits[0] == previous.bits[0] && same.bits[3] == 0x5u);
+    Require(same.bits[0] == Bit(15) && same.bits[1] == 0 && same.bits[2] == 0 && same.bits[3] == 0);
+    Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0);
+    Require(previous.bits[0] == wideApplied.bits[0] && previous.bits[3] == 0x5u);
     const GuestSignalSet none{{}};
     Require(sigprocmask_nid_postfix(3, &none, nullptr) == 0);
 
@@ -111,5 +128,22 @@ int main() {
     Require(previous.bits[0] == Bit(15) && previous.bits[1] == 0x1u);
     received = 0;
     Require(sigprocmask_nid_postfix(2, &inherited, nullptr) == 0 && received == 0);
-    Require(signal_nid_postfix(15, nullptr) == Callback);
+
+    Require(signal_nid_postfix(15, ignore) == Callback);
+    Require(sigprocmask_nid_postfix(1, &term, nullptr) == 0);
+    Require(raise_nid_postfix(15) == 0);
+    Require(signal_nid_postfix(15, Callback) == ignore);
+    Require(sigprocmask_nid_postfix(2, &term, nullptr) == 0 && received == 0);
+    Require(sigprocmask_nid_postfix(1, &term, nullptr) == 0);
+    Require(raise_nid_postfix(15) == 0 && received == 0);
+    Require(signal_nid_postfix(15, ignore) == Callback);
+    Require(signal_nid_postfix(15, Callback) == ignore);
+    Require(sigprocmask_nid_postfix(2, &term, nullptr) == 0 && received == 0);
+
+    Require(signal_nid_postfix(15, Scoped) == Callback);
+    Require(raise_nid_postfix(15) == 0);
+    Require(scopedEntries.load() == 2 && scopedNested.load() == 1 && scopedSeen.load() == Bit(15));
+    Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0);
+    Require(previous.bits[0] == 0);
+    Require(signal_nid_postfix(15, nullptr) == Scoped);
 }

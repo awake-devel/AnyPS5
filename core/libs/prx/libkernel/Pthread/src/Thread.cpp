@@ -105,6 +105,10 @@ static void UnregisterStack(PthreadPrivate* self) {
     liveStacks.erase(self);
 }
 
+PthreadPrivate* CurrentGuestThread() {
+    return currentThread;
+}
+
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end) {
     std::uintptr_t low = 0;
     std::uintptr_t high = 0;
