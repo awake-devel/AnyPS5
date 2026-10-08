@@ -92,7 +92,6 @@ static_assert(offsetof(GuestUcontext, mcontext) + offsetof(GuestMcontext, rsp) =
 using GuestExceptionHandler = void (APS5_VABI *)(int, void*);
 
 constexpr std::array<int, 6> AllowedSignals{1, 4, 8, 10, 11, 30};
-constexpr int RaisedSignal = 30;
 
 std::array<std::atomic<void*>, 32> handlers{};
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -224,6 +223,10 @@ bool Exited(HANDLE native) {
 
 bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     if (thread == scePthreadSelf()) {
+        if (GuestSignalBlocked(*thread, signum)) {
+            thread->pendingSignals.fetch_or(GuestSignalBit(signum));
+            return true;
+        }
         CONTEXT context{};
         RtlCaptureContext(&context);
         Deliver(handler, signum, context);
@@ -238,6 +241,17 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     if (Exited(native)) {
         ResumeThread(native);
         return false;
+    }
+    CONTEXT stopped{};
+    stopped.ContextFlags = CONTEXT_CONTROL;
+    if (!GetThreadContext(native, &stopped)) {
+        ResumeThread(native);
+        throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
+    }
+    if (GuestSignalBlocked(*thread, signum)) {
+        thread->pendingSignals.fetch_or(GuestSignalBit(signum));
+        ResumeThread(native);
+        return true;
     }
     if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
         const bool accepted = QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) != 0;
@@ -269,7 +283,6 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     return true;
 }
 #else
-constexpr int HostSignal = SIGUSR1;
 constexpr std::size_t FxsaveRegisterBytes = 416;
 
 void FromHost(const mcontext_t& host, GuestMcontext& m) {
@@ -323,7 +336,7 @@ void ToHost(const GuestMcontext& m, mcontext_t& host) {
 }
 
 void Deliver(int, siginfo_t*, void* context) {
-    const auto handler = Handler(RaisedSignal);
+    const auto handler = Handler(GUEST_RAISED_SIGNAL);
     if (handler == nullptr) {
         static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
         const auto written = write(STDERR_FILENO, message, sizeof(message) - 1);
@@ -333,7 +346,7 @@ void Deliver(int, siginfo_t*, void* context) {
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     GuestUcontext ucontext{};
     FromHost(host, ucontext.mcontext);
-    CallHandler(handler, RaisedSignal, ucontext);
+    CallHandler(handler, GUEST_RAISED_SIGNAL, ucontext);
     ToHost(ucontext.mcontext, host);
 }
 
@@ -343,7 +356,7 @@ void InstallDelivery() {
         action.sa_sigaction = Deliver;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&action.sa_mask);
-        if (sigaction(HostSignal, &action, nullptr) != 0)
+        if (sigaction(HOST_RAISED_SIGNAL, &action, nullptr) != 0)
             throw std::system_error(errno, std::generic_category(), "sceKernelRaiseException: cannot install the host signal handler");
         return true;
     }();
@@ -351,7 +364,7 @@ void InstallDelivery() {
 }
 
 bool Send(Pthread thread) {
-    const int result = pthread_kill(thread->hostThread, HostSignal);
+    const int result = pthread_kill(thread->hostThread, HOST_RAISED_SIGNAL);
     if (result == ESRCH) return false;
     if (result != 0) throw std::system_error(result, std::generic_category(), "sceKernelRaiseException: cannot signal the target thread");
     return true;
@@ -362,7 +375,7 @@ public:
     HostSignalBlock() {
         sigset_t blocked;
         sigemptyset(&blocked);
-        sigaddset(&blocked, HostSignal);
+        sigaddset(&blocked, HOST_RAISED_SIGNAL);
         pthread_sigmask(SIG_BLOCK, &blocked, &previous);
     }
     ~HostSignalBlock() { pthread_sigmask(SIG_SETMASK, &previous, nullptr); }
@@ -427,7 +440,7 @@ int APS5_VABI sceKernelRemoveExceptionHandler(int signum) {
 }
 
 int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
- if (signum != RaisedSignal) return SCE_KERNEL_ERROR_EINVAL;
+ if (signum != GUEST_RAISED_SIGNAL) return SCE_KERNEL_ERROR_EINVAL;
  if (thread == nullptr || thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
  const auto handler = Handler(signum);
  if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: no handler installed for the signal");

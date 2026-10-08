@@ -296,6 +296,8 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         p->priority.store((*attr)->_schedpriority, std::memory_order_relaxed);
     }
     if (name) p->name = name;
+    if (currentThread)
+        for (std::size_t word = 0; word < p->signalMask.size(); ++word) p->signalMask[word].store(currentThread->signalMask[word].load());
     std::promise<bool> start;
     auto args = std::make_unique<ThreadArgs>(ThreadArgs{entry, arg, p.get()});
 #ifdef _WIN32

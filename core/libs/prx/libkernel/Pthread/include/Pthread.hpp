@@ -4,6 +4,7 @@
 #include <sched.h>
 #include "SceTypes.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -13,6 +14,7 @@
 #include <string>
 #include <thread>
 #ifndef _WIN32
+#include <csignal>
 #include <pthread.h>
 #endif
 
@@ -64,6 +66,10 @@ struct PthreadSemPrivate {
 };
 
 static constexpr KernelCpumask DEFAULT_THREAD_AFFINITY = 0x1FFF;
+static constexpr int GUEST_RAISED_SIGNAL = 30;
+#ifndef _WIN32
+static constexpr int HOST_RAISED_SIGNAL = SIGUSR1;
+#endif
 static constexpr int DEFAULT_THREAD_PRIORITY = 700;
 
 struct PthreadAttrPrivate {
@@ -90,6 +96,10 @@ struct PthreadPrivate {
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<int> waitCount{0};
+    std::array<std::atomic<std::uint32_t>, 4> signalMask{};
+#ifdef _WIN32
+    std::atomic<std::uint32_t> pendingSignals{0};
+#endif
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     std::mutex nameLock;
@@ -105,5 +115,13 @@ struct PthreadPrivate {
 };
 
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
+
+constexpr std::uint32_t GuestSignalBit(int signum) {
+    return 1u << ((signum - 1) & 31);
+}
+
+inline bool GuestSignalBlocked(const PthreadPrivate& thread, int signum) {
+    return (thread.signalMask[static_cast<std::size_t>(signum - 1) >> 5].load() & GuestSignalBit(signum)) != 0;
+}
 
 #endif

@@ -20,7 +20,12 @@ int APS5_VABI sceKernelCreateSema(KernelSema* sem, const char* name, uint32_t at
 int APS5_VABI sceKernelDeleteSema(KernelSema sem);
 int APS5_VABI sceKernelSignalSema(KernelSema sem, int count);
 int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time);
+int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet);
 }
+
+struct GuestSignalSet {
+    std::uint32_t bits[4];
+};
 
 static constexpr int SCE_KERNEL_ERROR_EINVAL = static_cast<int>(0x80020016);
 static constexpr int SCE_KERNEL_ERROR_ESRCH = static_cast<int>(0x80020003);
@@ -33,6 +38,7 @@ static constexpr std::size_t MxcsrOffset = 0x140 + 24;
 static constexpr std::uint32_t FlushToZero = 0x8000;
 static constexpr std::uint32_t ReservedMxcsrBit = 0x10000;
 static constexpr int StartingRounds = 50;
+static constexpr GuestSignalSet Sigusr1Set{{1u << (SIGUSR1 - 1), 0, 0, 0}};
 static constexpr std::uint64_t SpinMarker = 0x0123456789abcdefULL;
 static constexpr std::uint64_t PatchedR12 = 0x5a5a1234abcd0001ULL;
 static constexpr std::uint64_t PatchedXmm8 = 0x7e7e5678dcba0002ULL;
@@ -184,6 +190,19 @@ static void* APS5_VABI Starting(void*) {
     return nullptr;
 }
 
+static std::atomic<int> maskedStage{0};
+static std::atomic<std::thread::id> maskedId;
+
+static void* APS5_VABI Masked(void*) {
+    maskedId.store(std::this_thread::get_id());
+    Require(sigprocmask_nid_postfix(1, &Sigusr1Set, nullptr) == 0);
+    maskedStage.store(1);
+    while (maskedStage.load() != 2) std::this_thread::yield();
+    Require(sigprocmask_nid_postfix(2, &Sigusr1Set, nullptr) == 0);
+    maskedStage.store(3);
+    return nullptr;
+}
+
 static std::atomic<bool> finishedReturned{false};
 
 static void* APS5_VABI Finished(void*) {
@@ -298,6 +317,25 @@ int main() {
         startingRelease.store(true);
         Require(scePthreadJoin(startingThread, nullptr) == 0);
     }
+
+    int before = calls.load();
+    Require(sigprocmask_nid_postfix(1, &Sigusr1Set, nullptr) == 0);
+    Require(sceKernelRaiseException(scePthreadSelf(), SIGUSR1) == 0);
+    Require(sceKernelRaiseException(scePthreadSelf(), SIGUSR1) == 0);
+    Require(calls.load() == before);
+    Require(sigprocmask_nid_postfix(2, &Sigusr1Set, nullptr) == 0);
+    Require(calls.load() == before + 1 && handlerThread.load() == std::this_thread::get_id());
+
+    Pthread maskedThread = nullptr;
+    Require(scePthreadCreate(&maskedThread, nullptr, Masked, nullptr, "masked") == 0);
+    while (maskedStage.load() != 1) std::this_thread::yield();
+    before = calls.load();
+    Require(sceKernelRaiseException(maskedThread, SIGUSR1) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Require(calls.load() == before);
+    maskedStage.store(2);
+    ExpectDelivery(before, maskedId.load());
+    Require(scePthreadJoin(maskedThread, nullptr) == 0);
 
     Pthread finishedThread = nullptr;
     Require(scePthreadCreate(&finishedThread, nullptr, Finished, nullptr, "finished") == 0);
