@@ -14,6 +14,7 @@
 #include <psapi.h>
 #else
 #include <fstream>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -74,7 +75,32 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags);
 void* GuestLoadStartModule_nid_no_patch(const char* path, int flags, std::size_t args, const void* argp, int* result);
 void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name);
 int APS5_VABI dlclose_nid_postfix(void* handle);
+#ifndef _WIN32
+int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);
+#endif
 }
+
+#ifndef _WIN32
+namespace {
+bool IsRelinkedImage(const char* path) {
+  static constexpr char guestSuffix[] = ".guest.prx";
+  const std::string name = path;
+  if (name.size() > sizeof(guestSuffix) - 1 && name.ends_with(guestSuffix)) return true;
+  char executable[4096];
+  const auto length = ::readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+  return length > 0 && name == std::string(executable, static_cast<std::size_t>(length));
+}
+
+void FillGuestUnwindInfo(std::uint64_t addr, ModuleInfoForUnwind* info) {
+  ModuleInfoEx module{};
+  module.st_size = sizeof(ModuleInfoEx);
+  if (sceKernelGetModuleInfoFromAddr(addr, 2, &module) != 0) return;
+  info->eh_frame_hdr_addr = module.eh_frame_hdr_addr;
+  info->eh_frame_addr = module.eh_frame_addr;
+  info->eh_frame_size = module.eh_frame_size;
+}
+}
+#endif
 
 namespace {
 constexpr int kRtldNow = 2;
@@ -134,6 +160,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
     info->eh_frame_size = 0;
     info->seg0_addr = start;
     info->seg0_size = end - start;
+    if (parsed >= 8 && IsRelinkedImage(path)) FillGuestUnwindInfo(addr, info);
     return 0;
   }
   return SCE_KERNEL_ERROR_ESRCH;
