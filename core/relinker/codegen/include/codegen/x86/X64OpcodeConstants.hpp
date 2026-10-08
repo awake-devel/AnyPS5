@@ -110,6 +110,8 @@ inline constexpr std::uint8_t OneByteInt = 0xCD;
 inline constexpr std::uint8_t OneByteRetImm16 = 0xC2;
 inline constexpr std::uint8_t OneByteRetFarImm16 = 0xCA;
 inline constexpr std::uint8_t OneByteEnter = 0xC8;
+inline constexpr std::uint8_t OneByteMovMoffsMin = 0xA0;
+inline constexpr std::uint8_t OneByteMovMoffsMax = 0xA3;
 
 inline constexpr std::uint8_t TwoByteJccRel32Min = 0x80;
 inline constexpr std::uint8_t TwoByteJccRel32Max = 0x8F;

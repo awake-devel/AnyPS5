@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -206,11 +207,11 @@ void stateTests() {
     queue.context.erase(0x1c5);
     queue.shader[0x008] = 0x100;
     queue.shader[0x009] = 0;
-    Require(!AgcDriver::Graphics::PixelProgramUnset(queue), "a pixel program address was read as unset");
+    Require(!AgcDriver::Graphics::PixelProgramSkipped(queue), "a pixel program address was read as unset");
     Require(AgcDriver::Graphics::DrawRejection(queue, true).find("missing register at DWORD 0x1b3") != std::string::npos, "a real pixel program without SPI_PS_INPUT_ENA was accepted");
     expectFailure([&] { AgcDriver::Graphics::DecodePixelStageInfo(queue.context, std::array<std::uint8_t, 8>{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u}); }, "missing register");
     queue.shader[0x008] = 0;
-    Require(AgcDriver::Graphics::PixelProgramUnset(queue), "a zero pixel program address was not read as unset");
+    Require(AgcDriver::Graphics::PixelProgramSkipped(queue), "a zero pixel program address was not read as unset");
     Require(AgcDriver::Graphics::DrawRejection(queue, true).find("writes color") != std::string::npos, "a draw without a pixel program that writes color was accepted");
     queue.context[0x8e] = 0;
     Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a depth-only draw without a pixel program was rejected");
@@ -219,6 +220,71 @@ void stateTests() {
     const auto unset = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state), true);
     Require(unset.inputAddr == ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter), "unset pixel inputs of the null program did not read as PERSP_CENTER_ENA");
     for (const auto mode : unset.targetOutputMode) Require(mode == 0, "an unset SPI_SHADER_COL_FORMAT exported a color");
+    queue.shader[0x008] = 0x100;
+    queue.context[0x1c4] = 0;
+    queue.context[0x203] = 0;
+    Require(AgcDriver::Graphics::PixelProgramSkipped(queue), "a pixel program that writes nothing and cannot run was not skipped");
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a depth-only draw whose pixel program cannot run was rejected");
+    for (const auto [control, what] : {std::pair{0x400u, "EXEC_ON_NOOP"}, std::pair{0x40u, "KILL_ENABLE"}}) {
+        queue.context[0x203] = control;
+        Require(!AgcDriver::Graphics::PixelProgramSkipped(queue), std::string("a pixel program with ") + what + " was skipped");
+        Require(AgcDriver::Graphics::DrawRejection(queue, true).find("missing register at DWORD 0x1b3") != std::string::npos, std::string("a pixel program with ") + what + " ran without SPI_PS_INPUT_ENA");
+    }
+    queue.context[0x203] = 1;
+    Require(!AgcDriver::Graphics::PixelProgramSkipped(queue), "a pixel program with Z_EXPORT_ENABLE was skipped");
+    queue.context[0x203] = 0;
+    queue.context[0x1c4] = 1;
+    Require(!AgcDriver::Graphics::PixelProgramSkipped(queue), "a pixel program exporting depth was skipped");
+    queue.context[0x1c4] = 0;
+    queue.context[0x8e] = 0xf;
+    Require(!AgcDriver::Graphics::PixelProgramSkipped(queue), "a pixel program writing color was skipped");
+}
+
+VkFormatFeatureFlags srgb8Features = 0;
+
+void srgb8FormatProperties(VkPhysicalDevice, VkFormat format, VkFormatProperties* properties) {
+    *properties = {};
+    if (format == VK_FORMAT_R8_SRGB) properties->optimalTilingFeatures = srgb8Features;
+}
+
+void setProxyVariable(const char* value) {
+#ifdef _WIN32
+    _putenv_s("APS5_SRGB_ATTACHMENT_PROXY", value);
+#else
+    if (*value == 0) unsetenv("APS5_SRGB_ATTACHMENT_PROXY");
+    else setenv("APS5_SRGB_ATTACHMENT_PROXY", value, 1);
+#endif
+}
+
+void srgb8TargetTests() {
+    setProxyVariable("");
+    auto queue = makeState();
+    queue.context[0x31c] = 0x8604;
+    const auto color = AgcDriver::Graphics::DecodeState(queue).color;
+    Require(color.format == VK_FORMAT_R8_SRGB && color.elementBytes == 1 && color.componentMapping == 0xe4u, "the 8_SRGB color target did not decode as R8_SRGB");
+    for (std::uint32_t swap = 1; swap < 4; ++swap) {
+        queue.context[0x31c] = 0x8604 | (swap << 11u);
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported color format 1 number type 6 component swap " + std::to_string(swap));
+    }
+    queue.context[0x31c] = 0x860c;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported color format 3 number type 6 component swap 0");
+    AgcDriver::Graphics::Context context{};
+    context.formatProperties = srgb8FormatProperties;
+    const auto proxyOn = [&](std::uintptr_t device, VkFormatFeatureFlags features, VkFormat format = VK_FORMAT_R8_SRGB) {
+        srgb8Features = features;
+        context.physical = reinterpret_cast<VkPhysicalDevice>(device);
+        return AgcDriver::Graphics::AttachmentProxyFormat(context, format);
+    };
+    constexpr VkFormatFeatureFlags attachment = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    constexpr VkFormatFeatureFlags blend = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    Require(proxyOn(0x1000, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == VK_FORMAT_R8G8B8A8_SRGB, "a device without R8_SRGB attachments must render 8_SRGB through RGBA8_SRGB");
+    Require(proxyOn(0x2000, attachment) == VK_FORMAT_R8G8B8A8_SRGB, "a device without R8_SRGB blending must render 8_SRGB through RGBA8_SRGB");
+    Require(proxyOn(0x3000, attachment | blend) == VK_FORMAT_UNDEFINED, "a device with R8_SRGB attachments must render 8_SRGB directly");
+    Require(proxyOn(0x3000, 0) == VK_FORMAT_UNDEFINED, "the attachment proxy decision is not kept per device");
+    Require(proxyOn(0x4000, 0, VK_FORMAT_R8_UNORM) == VK_FORMAT_UNDEFINED && proxyOn(0x4000, 0, VK_FORMAT_R8G8_SRGB) == VK_FORMAT_UNDEFINED, "only 8_SRGB targets may render through a proxy");
+    setProxyVariable("1");
+    Require(proxyOn(0x5000, attachment | blend) == VK_FORMAT_R8G8B8A8_SRGB, "APS5_SRGB_ATTACHMENT_PROXY=1 did not force the proxy");
+    setProxyVariable("");
 }
 
 void hardwareScreenOffsetTests() {
@@ -648,6 +714,14 @@ void DepthBoundsBiasTests() {
     Require(state.depthBias && state.depthBiasConstant == 4.0f, "culled back faces must not constrain the front depth bias");
     queue.context[0x2de] = 0x1f0u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "units other than the depth format");
+    queue.context[0x2de] = 0x1e9u;
+    auto cleared = queue;
+    cleared.ClearContext();
+    for (const auto& [offset, value] : queue.context) {
+        if (offset != 0x2dfu) cleared.context[offset] = value;
+    }
+    state = AgcDriver::Graphics::DecodeState(cleared);
+    Require(state.depthBias && state.depthBiasConstant == 4.0f && state.depthBiasClamp == 0.0f, "a depth bias clamp the title never writes must decode as its reset value 0");
 }
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};
@@ -761,6 +835,73 @@ void metadataPassTests() {
             Require(AgcDriver::Graphics::FillDccClear(tenBitPass->targets[0].format, clear.keys, tenBitPass->targets[0].dccAlphaOnMsb, std::as_writable_bytes(std::span(copied))) && std::ranges::all_of(copied, [&](std::uint32_t word) { return word == clear.texel; }), "a copied " + name + " target under " + clear.code + " keys was not filled with its 10/10/10/2 texel");
         }
     }
+}
+
+alignas(256) std::array<std::uint8_t, 4096> cmaskMemory{};
+
+void cmaskTests() {
+    using AgcDriver::Graphics::DecodeColorBuffer;
+    auto queue = makeState();
+    queue.context[0x31c] |= 0x2000;
+    const auto cmaskAddress = reinterpret_cast<std::uintptr_t>(cmaskMemory.data());
+    queue.context[0x31f] = static_cast<std::uint32_t>(cmaskAddress >> 8u);
+    queue.context[0x398] = static_cast<std::uint32_t>(cmaskAddress >> 40u);
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0;
+    const auto target = DecodeColorBuffer(queue.context, 0);
+    Require(target.cmaskAddress == cmaskAddress && target.cmaskBytes == cmaskMemory.size(), "the fast-clear target lost its CMASK");
+    Require(DecodeColorBuffer(makeState().context, 0).cmaskAddress == 0, "a target without FAST_CLEAR got a CMASK");
+    using AgcDriver::Graphics::CmaskBytes;
+    Require(CmaskBytes(1920, 1080) == 0x6000 && CmaskBytes(960, 544) == 0x2000 && CmaskBytes(800, 450) == 0x1000 && CmaskBytes(1024, 512) == 0x1000 && CmaskBytes(3840, 2160) == 0x14000, "a CMASK does not span whole 1024x512 metablocks");
+    auto mipmapped = queue;
+    mipmapped.context[0x3b0] |= 1u << 28u;
+    expectFailure([&] { DecodeColorBuffer(mipmapped.context, 0); }, "mipmapped, 3D or array");
+    auto unaddressed = queue;
+    unaddressed.context[0x31f] = 0;
+    unaddressed.context[0x398] = 0;
+    expectFailure([&] { DecodeColorBuffer(unaddressed.context, 0); }, "without a CMASK address");
+
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0xcc0020;
+    auto pass = AgcDriver::Graphics::DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == cmaskAddress, "the metadata pass lost the target's CMASK");
+    const AgcDriver::Graphics::Context context{};
+    const auto texels = [&](std::uint32_t value) {
+        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, colorMemory.data() + offset, 4);
+            if (texel != value) return false;
+        }
+        return true;
+    };
+    const auto cmaskIs = [&](std::uint8_t value) { return std::all_of(cmaskMemory.begin(), cmaskMemory.end(), [&](std::uint8_t byte) { return byte == value; }); };
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    cmaskMemory.fill(0);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x11223344) && cmaskIs(0xff), "a CMASK fast clear was not eliminated into the texels");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au) && cmaskIs(0xff), "a pass over an expanded CMASK changed the texels");
+    cmaskMemory.fill(0);
+    cmaskMemory[cmaskMemory.size() - 1] = 0xff;
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "not all fast-cleared or all expanded");
+    Require(texels(0x5a5a5a5au), "a refused pass changed the texels");
+
+    queue.context[0x31c] |= 0x10000000;
+    const auto keysAddress = reinterpret_cast<std::uintptr_t>(dccKeys.data());
+    queue.context[0x325] = static_cast<std::uint32_t>(keysAddress >> 8u);
+    queue.context[0x3a8] = static_cast<std::uint32_t>(keysAddress >> 40u);
+    pass = AgcDriver::Graphics::DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == cmaskAddress && pass->targets[0].dccAddress == keysAddress, "a DCC fast-clear target lost its CMASK or DCC keys");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    cmaskMemory.fill(0xff);
+    dccKeys.fill(0x20);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x11223344) && cmaskIs(0xff) && std::ranges::all_of(dccKeys, [](std::uint8_t key) { return key == 0xff; }), "a DCC fast clear under an expanded CMASK was not eliminated through its keys");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    cmaskMemory.fill(0);
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "DCC color target that is not all expanded");
+    Require(texels(0x5a5a5a5au), "a refused pass changed the texels of a DCC target");
 }
 
 void DepthClipTests() {
@@ -2027,6 +2168,16 @@ bool recompilesDebugBranch(std::uint32_t opcode) {
     return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
 }
 
+void meshIndexBufferTests() {
+    const AgcDriver::Pm4::DrawParameters automatic{0, 96, 0, 1, 0, false};
+    const auto unindexed = AgcDriver::Graphics::MeshIndexBufferDescriptor(automatic);
+    Require(unindexed[0] == 0 && unindexed[1] == 0 && unindexed[2] == 0 && unindexed[3] == 0x31016facu, "a non-indexed mesh draw did not get a null index buffer V#");
+    const AgcDriver::Pm4::DrawParameters indexed{0x123456789a00ull, 5, 2, 1, 0, true};
+    const auto words = AgcDriver::Graphics::MeshIndexBufferDescriptor(indexed);
+    Require(words[0] == 0x56789a00u && words[1] == 0x1234u && words[2] == 12u && words[3] == 0x31016facu, "an indexed mesh draw's index buffer V# changed");
+    expectFailure([] { static_cast<void>(AgcDriver::Graphics::MeshIndexBufferDescriptor(AgcDriver::Pm4::DrawParameters{0, 3, 2, 1, 0, true})); }, "invalid mesh index buffer range");
+}
+
 void meshArgumentTests() {
     using AgcDriver::Graphics::MeshArguments;
     using AgcDriver::Graphics::ResolveMeshArguments;
@@ -2139,6 +2290,7 @@ int main() {
         }
         stateTests();
         hardwareScreenOffsetTests();
+        srgb8TargetTests();
         DepthClipTests();
         DepthStencilTests();
         ZExportTests();
@@ -2147,6 +2299,7 @@ int main() {
         DisabledColorTests();
         CompactedExportTests();
         metadataPassTests();
+        cmaskTests();
         ShaderStageTests();
         PixelInputLayoutTests();
         InitialContextTests();
@@ -2155,6 +2308,7 @@ int main() {
         misalignedShaderDataTests();
         debugBranchTests();
         meshArgumentTests();
+        meshIndexBufferTests();
         validationTests();
         vertexCopyTests();
         pixelParameterSlotTests();

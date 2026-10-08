@@ -12,6 +12,7 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
     bool rexPresent = false;
     std::uint8_t rex = 0;
     bool operandSizeOverride = false;
+    bool addressSizeOverride = false;
     bool repnePrefix = false;
 
     while (pos < available) {
@@ -28,7 +29,9 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
             repnePrefix = true;
         } else if (b == PrefixOperandSize) {
             operandSizeOverride = true;
-        } else if (b != PrefixLock && b != PrefixRep && b != PrefixAddressSize &&
+        } else if (b == PrefixAddressSize) {
+            addressSizeOverride = true;
+        } else if (b != PrefixLock && b != PrefixRep &&
                    b != PrefixSegCs && b != PrefixSegSs && b != PrefixSegDs &&
                    b != PrefixSegEs && b != PrefixSegFs && b != PrefixSegGs) {
             break;
@@ -38,6 +41,9 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
         rex = 0;
         pos += 1;
     }
+
+    const bool rexW = rexPresent && (rex & RexWBit) != 0;
+    const std::size_t operandImmediateSize = operandSizeOverride && !rexW ? ImmSize16 : ImmSize32;
 
     if (pos >= available) {
         throw CodegenException("Instruction truncated after prefixes");
@@ -172,10 +178,9 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
                    opcode == OneByteTestEaxImm32 ||
                    (opcode >= OneByteMovImm32RegMin && opcode <= OneByteMovImm32RegMax)) {
             if (opcode >= OneByteMovImm32RegMin && opcode <= OneByteMovImm32RegMax) {
-                immediateSize = (rexPresent && (rex & RexWBit) != 0) ? ImmSize64 :
-                    (operandSizeOverride ? ImmSize16 : ImmSize32);
+                immediateSize = rexW ? ImmSize64 : operandImmediateSize;
             } else {
-                immediateSize = operandSizeOverride ? ImmSize16 : ImmSize32;
+                immediateSize = operandImmediateSize;
             }
         } else if (opcode == OneByteImm8Grp1 || opcode == OneByteImulRm32Imm8) {
             immediateSize = ImmSize8;
@@ -202,6 +207,10 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
 
         if (opcode == OneByteEnter) {
             immediateSize = ImmSizeEnter;
+        }
+
+        if (opcode >= OneByteMovMoffsMin && opcode <= OneByteMovMoffsMax) {
+            immediateSize = addressSizeOverride ? ImmSize32 : ImmSize64;
         }
     } else {
         if (opcode == TwoByteExtrqInsertqImm8Imm8) {
@@ -279,7 +288,7 @@ std::size_t X64InstructionDecoder::Decode(const std::uint8_t* data, std::size_t 
         reg <= Grp3RegTestMax) {
         immediateSize = (opcode == OneByteTestGrp3Rm8)
             ? ImmSize8
-            : (operandSizeOverride ? ImmSize16 : ImmSize32);
+            : operandImmediateSize;
     }
 
     if (mod != ModRmModRegister && rm == ModRmRmSibPresent) {

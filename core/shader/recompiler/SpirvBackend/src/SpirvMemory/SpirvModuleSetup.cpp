@@ -77,6 +77,9 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitExtension(extension);
     }
     if (state.requirements.bufferInt64Atomics) {
+        if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) == state.supportedCapabilities.end()) {
+            FailEmit("64-bit buffer atomics need shaderBufferInt64Atomics");
+        }
         state.module.EmitCapability(spv::CapabilityInt64);
         state.module.EmitCapability(spv::CapabilityInt64Atomics);
     }
