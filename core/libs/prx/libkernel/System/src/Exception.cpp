@@ -107,6 +107,28 @@ GuestExceptionHandler Handler(int signum) {
     return reinterpret_cast<GuestExceptionHandler>(handlers[signum].load(std::memory_order_acquire));
 }
 
+constexpr std::size_t MxcsrOffset = 24;
+constexpr std::size_t MxcsrMaskOffset = 28;
+constexpr std::uint32_t DefaultMxcsrMask = 0xffbf;
+
+std::uint32_t FpWord(const GuestMcontext& m, std::size_t offset) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const unsigned char*>(m.fpstate) + offset, sizeof(value));
+    return value;
+}
+
+void SetFpWord(GuestMcontext& m, std::size_t offset, std::uint32_t value) {
+    std::memcpy(reinterpret_cast<unsigned char*>(m.fpstate) + offset, &value, sizeof(value));
+}
+
+void CallHandler(GuestExceptionHandler handler, int signum, GuestUcontext& ucontext) {
+    auto& m = ucontext.mcontext;
+    const std::uint32_t mxcsrMask = FpWord(m, MxcsrMaskOffset);
+    handler(signum, &ucontext);
+    SetFpWord(m, MxcsrOffset, FpWord(m, MxcsrOffset) & (mxcsrMask != 0 ? mxcsrMask : DefaultMxcsrMask));
+    SetFpWord(m, MxcsrMaskOffset, mxcsrMask);
+}
+
 #ifdef _WIN32
 constexpr std::size_t RedZone = 128;
 constexpr std::size_t HomeArea = 32;
@@ -143,7 +165,7 @@ void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
     m.len = sizeof(GuestMcontext);
     static_assert(sizeof(context.FltSave) <= sizeof(m.fpstate));
     std::memcpy(m.fpstate, &context.FltSave, sizeof(context.FltSave));
-    handler(signum, &ucontext);
+    CallHandler(handler, signum, ucontext);
     context.Rdi = m.rdi;
     context.Rsi = m.rsi;
     context.Rdx = m.rdx;
@@ -163,6 +185,7 @@ void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
     context.Rsp = m.rsp;
     context.EFlags = static_cast<DWORD>(m.rflags);
     std::memcpy(&context.FltSave, m.fpstate, sizeof(context.FltSave));
+    context.MxCsr = context.FltSave.MxCsr;
 }
 
 [[noreturn]] void RedirectedEntry(Delivery* delivery) {
@@ -310,7 +333,7 @@ void Deliver(int, siginfo_t*, void* context) {
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     GuestUcontext ucontext{};
     FromHost(host, ucontext.mcontext);
-    handler(RaisedSignal, &ucontext);
+    CallHandler(handler, RaisedSignal, ucontext);
     ToHost(ucontext.mcontext, host);
 }
 
